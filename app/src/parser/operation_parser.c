@@ -16,10 +16,15 @@
    See the License for the specific language governing permissions and
    limitations under the License. */
 
+#include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "operation_parser.h"
+#include "fa2_tokens.h"
+#include "formatting.h"
 #include "micheline_parser.h"
+#include "micheline_state.h"
 #include "num_parser.h"
 
 /* Prototypes */
@@ -27,31 +32,41 @@
 static tz_parser_result push_frame(tz_parser_state              *state,
                                    tz_operation_parser_step_kind step);
 static tz_parser_result pop_frame(tz_parser_state *state);
+static tz_parser_result tz_step_read_set_delegate_params(
+    tz_parser_state *state);
+static void tz_manager_entrypoint_set(tz_operation_state *op,
+                                      const char         *name);
+static bool tz_implicit_fee_payer_differs_from_dest(
+    const tz_operation_state *op);
 
 #ifdef TEZOS_DEBUG
-const char *const tz_operation_parser_step_name[] = {"OPTION",
-                                                     "TUPLE",
-                                                     "MAGIC",
-                                                     "READ_BINARY",
-                                                     "BRANCH",
-                                                     "BATCH",
-                                                     "TAG",
-                                                     "SIZE",
-                                                     "FIELD",
-                                                     "PRINT",
-                                                     "PARTIAL_PRINT",
-                                                     "READ_NUM",
-                                                     "READ_INT32",
-                                                     "READ_PK",
-                                                     "READ_BYTES",
-                                                     "READ_STRING",
-                                                     "READ_SMART_ENTRYPOINT",
-                                                     "READ_MICHELINE",
-                                                     "READ_SORU_MESSAGES",
-                                                     "READ_SORU_KIND",
-                                                     "READ_BALLOT",
-                                                     "READ_PROTOS",
-                                                     "READ_PKH_LIST"};
+const char *const tz_operation_parser_step_name[]
+    = {"OPTION",
+       "TUPLE",
+       "MAGIC",
+       "READ_BINARY",
+       "BRANCH",
+       "BATCH",
+       "TAG",
+       "SIZE",
+       "FIELD",
+       "PRINT",
+       "PARTIAL_PRINT",
+       "READ_NUM",
+       "READ_INT32",
+       "READ_PK",
+       "READ_BLS_SIG",
+       "READ_BYTES",
+       "READ_STRING",
+       "READ_SMART_ENTRYPOINT",
+       "READ_MICHELINE",
+       "READ_SORU_MESSAGES",
+       "READ_SORU_KIND",
+       "READ_BALLOT",
+       "READ_PROTOS",
+       "READ_PKH_LIST",
+       "READ_FA2_TRANSFER",
+       "READ_SET_DELEGATE_PARAMS"};
 
 /**
  * @brief Get the string format of an operations step
@@ -250,6 +265,43 @@ TZ_OPERATION_FIELDS(soru_origin_fields,
         .display_none=false)
 );
 
+#define FA2_REQUIRE(state, cond) \
+    do { \
+        if (!(cond)) \
+            return fa2_fallback_to_micheline(state); \
+    } while (0)
+
+/**
+ * @brief Read one byte, require it equals @p expected_byte, then advance
+ *        sub_step to @p next.  Falls back to Micheline on mismatch.
+ */
+#define FA2_READ_EXPECT_BYTE(state, op, b, expected_byte, next) \
+    do { \
+        tz_must(tz_parser_read((state), &(b))); \
+        FA2_REQUIRE((state), (b) == (expected_byte)); \
+        (op)->frame->step_read_fa2.sub_step = (next); \
+        tz_continue; \
+    } while (0)
+
+/**
+ * @brief Accumulate one byte of a big-endian 4-byte size field.
+ *        When all 4 bytes have been read, require the result is non-zero
+ *        and advance sub_step to @p next.
+ */
+#define FA2_READ_SIZE_BYTE(state, op, b, next) \
+    do { \
+        tz_must(tz_parser_read((state), &(b))); \
+        (op)->frame->step_read_fa2.size_val = \
+            ((op)->frame->step_read_fa2.size_val << 8) | (b); \
+        (op)->frame->step_read_fa2.size_ofs++; \
+        if ((op)->frame->step_read_fa2.size_ofs < 4) { \
+            tz_continue; \
+        } \
+        FA2_REQUIRE((state), (op)->frame->step_read_fa2.size_val != 0); \
+        (op)->frame->step_read_fa2.sub_step = (next); \
+        tz_continue; \
+    } while (0)
+
 /**
  * @brief Array of all handled operations
  */
@@ -329,7 +381,8 @@ tz_operation_parser_init(tz_parser_state *state, uint16_t size,
     tz_operation_state *op = &state->operation;
 
     tz_parser_init(state);
-    state->operation.seen_reveal = 0;
+    state->operation.seen_reveal      = 0;
+    state->operation.is_fa2_candidate = 0;
     memset(&state->operation.source, 0, 22);
     memset(&state->operation.destination, 0, 22);
     op->batch_index = 0;
@@ -372,6 +425,21 @@ tz_operation_parser_init(tz_parser_state *state, uint16_t size,
  * @param state: parser state
  * @return tz_parser_result: parser result
  */
+static void
+tz_manager_entrypoint_set(tz_operation_state *op, const char *name)
+{
+    strlcpy(op->manager_entrypoint, name, sizeof(op->manager_entrypoint));
+}
+
+static bool
+tz_implicit_fee_payer_differs_from_dest(const tz_operation_state *op)
+{
+    if (op->destination[0] != 0x00) {
+        return true;
+    }
+    return memcmp(op->source, op->destination + 1, 21) != 0;
+}
+
 static tz_parser_result
 tz_print_string(tz_parser_state *state)
 {
@@ -380,6 +448,9 @@ tz_print_string(tz_parser_state *state)
     if (op->frame->step_read_string.skip) {
         tz_must(pop_frame(state));
         tz_continue;
+    }
+    if (strcmp(state->field_info.field_name, "Entrypoint") == 0) {
+        tz_manager_entrypoint_set(op, (const char *)CAPTURE);
     }
     op->frame->step           = TZ_OPERATION_STEP_PRINT;
     op->frame->step_print.str = (char *)CAPTURE;
@@ -401,7 +472,7 @@ tz_print_string(tz_parser_state *state)
     } while (0)
 
 /**
- * @brief Try to read an optionnal field
+ * @brief Try to read an optional field
  *
  *        If the field is present, ask to read it.
  *
@@ -553,6 +624,11 @@ tz_step_tag(tz_parser_state *state)
         op->nb_reveal++;
     }
 #endif  // HAVE_SWAP
+    op->is_fa2_candidate = 0;
+    memset(&op->destination, 0, TZ_OPERATION_DESTINATION_SIZE);
+    /* Reset per-operation so a stale entrypoint from a previous batched
+       operation cannot drive the SDP clear-signing path (F-04). */
+    op->manager_entrypoint[0] = '\0';
     for (d = tz_operation_descriptors; d->tag != TZ_OPERATION_TAG_END; d++) {
         if (d->tag == t) {
             op->frame->step                   = TZ_OPERATION_STEP_TUPLE;
@@ -568,6 +644,744 @@ tz_step_tag(tz_parser_state *state)
     tz_raise(INVALID_TAG);
 }
 
+/* FA2 transfer parser sub-steps */
+#define FA2_STEP_OUTER_SEQ_TAG   0  /* expect 0x02 (SEQ) */
+#define FA2_STEP_OUTER_SEQ_SIZE  1  /* read 4-byte size */
+#define FA2_STEP_OUTER_PAIR_TAG  2  /* expect 0x07 (PRIM_2_NOANNOTS) */
+#define FA2_STEP_OUTER_PAIR_OP   3  /* expect 0x07 (Pair opcode) */
+#define FA2_STEP_FROM_ADDR_TAG   4  /* expect 0x01 (STRING) or 0x0A (BYTES) */
+#define FA2_STEP_FROM_ADDR_SIZE  5  /* read 4-byte size */
+#define FA2_STEP_FROM_ADDR_BYTES 6  /* read addr_len bytes into CAPTURE */
+#define FA2_STEP_TXS_SEQ_TAG     7  /* expect 0x02 (SEQ) */
+#define FA2_STEP_TXS_SEQ_SIZE    8  /* read 4-byte size */
+#define FA2_STEP_TXS_PAIR_TAG    9  /* expect 0x07 (PRIM_2_NOANNOTS) */
+#define FA2_STEP_TXS_PAIR_OP     10 /* expect 0x07 (Pair opcode) */
+#define FA2_STEP_TO_ADDR_TAG     11 /* expect 0x01 (STRING) or 0x0A (BYTES) */
+#define FA2_STEP_TO_ADDR_SIZE    12 /* read 4-byte size */
+#define FA2_STEP_TO_ADDR_BYTES   13 /* read addr_len bytes into CAPTURE */
+#define FA2_STEP_INNER_SEQ_TAG   14 /* expect 0x02 (SEQ) */
+#define FA2_STEP_INNER_SEQ_SIZE  15 /* read 4-byte size */
+#define FA2_STEP_INNER_PAIR_TAG  16 /* expect 0x07 (PRIM_2_NOANNOTS) */
+#define FA2_STEP_INNER_PAIR_OP   17 /* expect 0x07 (Pair opcode) */
+#define FA2_STEP_TOKEN_ID_TAG    18 /* expect 0x00 (INT) */
+#define FA2_STEP_TOKEN_ID_VAL    19 /* read Zarith token_id */
+#define FA2_STEP_AMOUNT_TAG      20 /* expect 0x00 (INT) */
+#define FA2_STEP_AMOUNT_VAL      21 /* read varint */
+#define FA2_STEP_VERIFY_END      22 /* verify no extra outer items */
+#define FA2_STEP_EMIT_TO_ADDR    23 /* emit "Transfer tokens to" field */
+#define FA2_STEP_EMIT_TOKEN_ID   25 /* emit "Token ID" (unregistered token) */
+#define FA2_STEP_EMIT_AMOUNT     24 /* emit amount field */
+
+/* Saved FA2 addresses: from_ in first half, to_ in second half of CAPTURE */
+#define FA2_FROM_ADDR_OFS 0
+#define FA2_TO_ADDR_OFS   (TZ_CAPTURE_BUFFER_SIZE / 2)
+#define FA2_ADDR_MAX_LEN  (TZ_CAPTURE_BUFFER_SIZE / 2 - 1)
+
+_Static_assert((TZ_CAPTURE_BUFFER_SIZE % 2U) == 0U,
+               "TZ_CAPTURE_BUFFER_SIZE must be even for FA2 CAPTURE split");
+
+/**
+ * @brief Format an integer token amount string with token decimals and
+ * symbol.
+ *
+ * @param str       Decimal ASCII digits buffer (in/out, NUL-terminated).
+ * @param buf_size  Size of @p str (including the trailing NUL byte).
+ * @param decimals  Number of fractional digits for the token.
+ * @param symbol    Optional token symbol appended as " <symbol>" when it
+ * fits.
+ *
+ * Formatting is done in three phases:
+ * - left-pad with zeros when the integer has fewer than decimals+1 digits,
+ * - insert a decimal separator and trim trailing fractional zeros,
+ * - append the token symbol if enough space remains.
+ *
+ * The function never writes past @p buf_size. If the symbol would not fit, it
+ * is skipped and only the formatted amount is kept.
+ */
+static void
+tz_format_token_amount(char *str, size_t buf_size, uint8_t decimals,
+                       const char *symbol)
+{
+    size_t len;
+
+    if ((str == NULL) || (buf_size == 0)) {
+        return;
+    }
+
+    len = strlen(str);
+    if (len >= buf_size) {
+        str[buf_size - 1] = 0;
+        len               = buf_size - 1;
+    }
+
+    if (len == 0) {
+        if (buf_size < 2) {
+            str[0] = 0;
+            return;
+        }
+        str[0] = '0';
+        str[1] = 0;
+        len    = 1;
+    }
+
+    if (decimals > 0) {
+        size_t frac_digits = (size_t)decimals;
+
+        /* Ensure at least decimals+1 integer digits by left-padding with '0'.
+         */
+        if (len <= frac_digits) {
+            int pad = (int)(frac_digits + 1U - len);
+            /* +1U: room for NUL terminator moved by the right-shift loop. */
+            if ((len + (size_t)pad + 1U) > buf_size) {
+                return;
+            }
+            for (int j = (int)len; j >= 0; j--) {
+                str[j + pad] = str[j];
+            }
+            for (int j = 0; j < pad; j++) {
+                str[j] = '0';
+            }
+            len += (size_t)pad;
+        }
+
+        /* Detect whether the whole fractional part is zero. */
+        int no_decimals = 1;
+        for (size_t i = 0; i < frac_digits; i++) {
+            no_decimals &= (str[len - 1 - i] == '0');
+        }
+        if (no_decimals) {
+            str[len - frac_digits] = 0;
+            len -= frac_digits;
+        } else {
+            /* Insert '.', then trim trailing fractional zeros and a trailing
+             * '.'. */
+            if ((len + 1U) >= buf_size) {
+                return;
+            }
+            for (size_t i = 0; i < frac_digits; i++) {
+                str[len - i] = str[len - i - 1];
+            }
+            str[len - frac_digits] = '.';
+            len++;
+            str[len] = 0;
+            while ((len > 0) && (str[len - 1] == '0')) {
+                len--;
+                str[len] = 0;
+            }
+            if ((len > 0) && (str[len - 1] == '.')) {
+                len--;
+                str[len] = 0;
+            }
+        }
+    }
+
+    if ((symbol != NULL) && symbol[0]) {
+        size_t symbol_len = strlen(symbol);
+        if ((len + 1U + symbol_len + 1U) <= buf_size) {
+            strlcat(str, " ", buf_size);
+            strlcat(str, symbol, buf_size);
+        }
+    }
+}
+
+/**
+ * @brief Format an unsigned 64-bit integer as a decimal string
+ *
+ * @param out: output buffer
+ * @param out_size: size of the output buffer
+ * @param value: value to format
+ */
+static bool
+tz_u64_to_string(char *out, size_t out_size, uint64_t value)
+{
+    char   tmp[20];  // uint64 max is 20 decimal digits
+    size_t i = 0;
+    size_t j = 0;
+
+    if ((out == NULL) || (out_size == 0)) {
+        return false;
+    }
+
+    if (value == 0) {
+        tmp[i++] = '0';
+    }
+    while ((value > 0) && (i < sizeof(tmp))) {
+        tmp[i++] = (char)('0' + (value % 10));
+        value /= 10;
+    }
+    // Reject rather than silently emit a truncated (and therefore wrong)
+    // value when the buffer cannot hold every digit plus the NUL.
+    if ((i + 1U) > out_size) {
+        out[0] = '\0';
+        return false;
+    }
+    // digits were produced least-significant first; reverse into `out`
+    while (i > 0) {
+        out[j++] = tmp[--i];
+    }
+    out[j] = '\0';
+    return true;
+}
+
+/**
+ * @brief Switch FA2 parser to Micheline fallback for remaining bytes
+ *
+ *        Called when the FA2 structure does not match the expected
+ *        single-item transfer pattern. Remaining bytes are displayed
+ *        as Micheline with the complex flag set.
+ */
+static tz_parser_result
+fa2_fallback_to_micheline(tz_parser_state *state)
+{
+    tz_operation_state *op   = &state->operation;
+    tz_parser_regs     *regs = &state->regs;
+    size_t consumed          = (size_t)(state->ofs - op->fa2_payload_start);
+
+    /* Rewind the input stream to the FA2 parse start so the Micheline
+       fallback re-reads the bytes already consumed by the FA2 parser.
+       Guard against underflow across an APDU refill boundary. */
+    if (consumed > regs->iofs) {
+        tz_raise(UNSUPPORTED);
+    }
+    regs->ilen += consumed;
+    regs->iofs -= consumed;
+    state->ofs = op->fa2_payload_start;
+
+    op->frame->step                       = TZ_OPERATION_STEP_READ_MICHELINE;
+    op->frame->step_read_micheline.inited = 0;
+    op->frame->step_read_micheline.skip   = 0;
+    op->frame->step_read_micheline.name   = "Parameter";
+    state->field_info.is_field_complex    = true;
+    STRLCPY(state->field_info.field_name, "Parameter");
+    tz_continue;
+}
+
+/**
+ * @brief Read and parse an FA2 transfer parameter for clear signing
+ *
+ *        Supports single-item transfers where token_id is any nat.
+ *        The innermost list(pair(token_id, amount)) may be Micheline-encoded
+ *        either as SEQ[Pair(...)] or as a direct Pair (single-element list).
+ *        Falls back to raw Micheline display for unsupported patterns.
+ *
+ *        See docs/FA2_CLEAR_SIGNING.md for scope, registry behavior, and
+ *        fallback rules.
+ *
+ * @param state: parser state
+ * @return tz_parser_result: parser result
+ */
+static tz_parser_result
+tz_step_read_fa2_transfer(tz_parser_state *state)
+{
+    ASSERT_STEP(state, READ_FA2_TRANSFER);
+    tz_operation_state *op   = &state->operation;
+    tz_parser_regs     *regs = &state->regs;
+    uint8_t             b;
+
+    switch (op->frame->step_read_fa2.sub_step) {
+    /* ---- outer list ---- */
+    case FA2_STEP_OUTER_SEQ_TAG:
+        /* Record the payload start (after the 4-byte size prefix) so the
+           Micheline fallback can rewind the consumed bytes. Safe to set on
+           each re-entry: state->ofs has not advanced if the read blocked. */
+        op->fa2_payload_start = state->ofs;
+        tz_must(tz_parser_read(state, &b));
+        FA2_REQUIRE(state, b == 0x02);
+
+        op->frame->step_read_fa2.sub_step = FA2_STEP_OUTER_SEQ_SIZE;
+        op->frame->step_read_fa2.size_ofs = 0;
+        op->frame->step_read_fa2.size_val = 0;
+        tz_continue;
+
+    case FA2_STEP_OUTER_SEQ_SIZE:
+        FA2_READ_SIZE_BYTE(state, op, b, FA2_STEP_OUTER_PAIR_TAG);
+
+    case FA2_STEP_OUTER_PAIR_TAG:
+        FA2_READ_EXPECT_BYTE(state, op, b, 0x07, FA2_STEP_OUTER_PAIR_OP);
+
+    case FA2_STEP_OUTER_PAIR_OP:
+        FA2_READ_EXPECT_BYTE(state, op, b, 0x07, FA2_STEP_FROM_ADDR_TAG);
+
+    /* ---- from_ address ---- */
+    case FA2_STEP_FROM_ADDR_TAG:
+        tz_must(tz_parser_read(state, &b));
+
+        FA2_REQUIRE(state, b == 0x01 || b == 0x0A);
+
+        op->frame->step_read_fa2.addr_tag = b;
+        op->frame->step_read_fa2.sub_step = FA2_STEP_FROM_ADDR_SIZE;
+        op->frame->step_read_fa2.size_ofs = 0;
+        op->frame->step_read_fa2.size_val = 0;
+        tz_continue;
+
+    case FA2_STEP_FROM_ADDR_SIZE:
+        tz_must(tz_parser_read(state, &b));
+        op->frame->step_read_fa2.size_val
+            = (op->frame->step_read_fa2.size_val << 8) | b;
+        op->frame->step_read_fa2.size_ofs++;
+        if (op->frame->step_read_fa2.size_ofs < 4) {
+            tz_continue;
+        }
+        FA2_REQUIRE(state, op->frame->step_read_fa2.size_val > 0
+                               && op->frame->step_read_fa2.size_val
+                                      <= FA2_ADDR_MAX_LEN);
+        op->frame->step_read_fa2.addr_len = op->frame->step_read_fa2.size_val;
+        op->frame->step_read_fa2.addr_ofs = 0;
+        op->frame->step_read_fa2.sub_step = FA2_STEP_FROM_ADDR_BYTES;
+        tz_continue;
+
+    case FA2_STEP_FROM_ADDR_BYTES:
+        tz_must(tz_parser_read(state, &b));
+        CAPTURE[FA2_FROM_ADDR_OFS + op->frame->step_read_fa2.addr_ofs] = b;
+        op->frame->step_read_fa2.addr_ofs++;
+        op->frame->step_read_fa2.addr_len--;
+        if (op->frame->step_read_fa2.addr_len > 0) {
+            tz_continue;
+        }
+        /* Address fully read; null-terminate for string case */
+        CAPTURE[FA2_FROM_ADDR_OFS + op->frame->step_read_fa2.addr_ofs] = 0;
+        if (op->frame->step_read_fa2.addr_tag == 0x0A) {
+            /* Binary address: format it in-place */
+            FA2_REQUIRE(state, tz_format_address(
+                                   CAPTURE + FA2_FROM_ADDR_OFS,
+                                   op->frame->step_read_fa2.addr_ofs,
+                                   (char *)(CAPTURE + FA2_FROM_ADDR_OFS),
+                                   FA2_ADDR_MAX_LEN)
+                                   == 0);
+        }
+        op->frame->step_read_fa2.sub_step = FA2_STEP_TXS_SEQ_TAG;
+        tz_continue;
+
+    /* ---- txs list ---- */
+    case FA2_STEP_TXS_SEQ_TAG:
+        tz_must(tz_parser_read(state, &b));
+        FA2_REQUIRE(state, b == 0x02);
+        op->frame->step_read_fa2.sub_step = FA2_STEP_TXS_SEQ_SIZE;
+        op->frame->step_read_fa2.size_ofs = 0;
+        op->frame->step_read_fa2.size_val = 0;
+        tz_continue;
+
+    case FA2_STEP_TXS_SEQ_SIZE:
+        FA2_READ_SIZE_BYTE(state, op, b, FA2_STEP_TXS_PAIR_TAG);
+
+    case FA2_STEP_TXS_PAIR_TAG:
+        FA2_READ_EXPECT_BYTE(state, op, b, 0x07, FA2_STEP_TXS_PAIR_OP);
+
+    case FA2_STEP_TXS_PAIR_OP:
+        FA2_READ_EXPECT_BYTE(state, op, b, 0x07, FA2_STEP_TO_ADDR_TAG);
+
+    /* ---- to_ address ---- */
+    case FA2_STEP_TO_ADDR_TAG:
+        tz_must(tz_parser_read(state, &b));
+
+        FA2_REQUIRE(state, b == 0x01 || b == 0x0A);
+
+        op->frame->step_read_fa2.addr_tag = b;
+        op->frame->step_read_fa2.sub_step = FA2_STEP_TO_ADDR_SIZE;
+        op->frame->step_read_fa2.size_ofs = 0;
+        op->frame->step_read_fa2.size_val = 0;
+        tz_continue;
+
+    case FA2_STEP_TO_ADDR_SIZE:
+        tz_must(tz_parser_read(state, &b));
+        op->frame->step_read_fa2.size_val
+            = (op->frame->step_read_fa2.size_val << 8) | b;
+        op->frame->step_read_fa2.size_ofs++;
+        if (op->frame->step_read_fa2.size_ofs < 4) {
+            tz_continue;
+        }
+        FA2_REQUIRE(state, op->frame->step_read_fa2.size_val > 0
+                               && op->frame->step_read_fa2.size_val
+                                      <= FA2_ADDR_MAX_LEN);
+        op->frame->step_read_fa2.addr_len = op->frame->step_read_fa2.size_val;
+        op->frame->step_read_fa2.addr_ofs = 0;
+        op->frame->step_read_fa2.sub_step = FA2_STEP_TO_ADDR_BYTES;
+        tz_continue;
+
+    case FA2_STEP_TO_ADDR_BYTES:
+        tz_must(tz_parser_read(state, &b));
+        CAPTURE[FA2_TO_ADDR_OFS + op->frame->step_read_fa2.addr_ofs] = b;
+        op->frame->step_read_fa2.addr_ofs++;
+        op->frame->step_read_fa2.addr_len--;
+        if (op->frame->step_read_fa2.addr_len > 0) {
+            tz_continue;
+        }
+        /* Address fully read; null-terminate for string case */
+        CAPTURE[FA2_TO_ADDR_OFS + op->frame->step_read_fa2.addr_ofs] = 0;
+        if (op->frame->step_read_fa2.addr_tag == 0x0A) {
+            FA2_REQUIRE(state,
+                        tz_format_address(CAPTURE + FA2_TO_ADDR_OFS,
+                                          op->frame->step_read_fa2.addr_ofs,
+                                          (char *)(CAPTURE + FA2_TO_ADDR_OFS),
+                                          FA2_ADDR_MAX_LEN)
+                            == 0);
+        }
+        op->frame->step_read_fa2.sub_step = FA2_STEP_INNER_SEQ_TAG;
+        tz_continue;
+
+    /* ---- inner txs item (single pair: token_id + amount) ---- */
+    case FA2_STEP_INNER_SEQ_TAG:
+        tz_must(tz_parser_read(state, &b));
+        if (b == 0x02) { /* SEQ */
+            op->frame->step_read_fa2.sub_step = FA2_STEP_INNER_SEQ_SIZE;
+            op->frame->step_read_fa2.size_ofs = 0;
+            op->frame->step_read_fa2.size_val = 0;
+        } else if (b == 0x07) {
+            /* Direct Pair (no SEQ): single-element list encoding (e.g. Temple
+             * Wallet) */
+            op->frame->step_read_fa2.sub_step = FA2_STEP_INNER_PAIR_OP;
+        } else {
+            return fa2_fallback_to_micheline(state);
+        }
+        tz_continue;
+
+    case FA2_STEP_INNER_SEQ_SIZE:
+        FA2_READ_SIZE_BYTE(state, op, b, FA2_STEP_INNER_PAIR_TAG);
+
+    case FA2_STEP_INNER_PAIR_TAG:
+        FA2_READ_EXPECT_BYTE(state, op, b, 0x07, FA2_STEP_INNER_PAIR_OP);
+
+    case FA2_STEP_INNER_PAIR_OP:
+        FA2_READ_EXPECT_BYTE(state, op, b, 0x07, FA2_STEP_TOKEN_ID_TAG);
+
+    /* ---- token_id (uint64) ---- */
+    case FA2_STEP_TOKEN_ID_TAG:
+        tz_must(tz_parser_read(state, &b));
+        FA2_REQUIRE(state, b == 0x00);
+        op->frame->step_read_fa2.token_id_val   = 0;
+        op->frame->step_read_fa2.token_id_shift = 0;
+        op->frame->step_read_fa2.sub_step       = FA2_STEP_TOKEN_ID_VAL;
+        tz_continue;
+
+    case FA2_STEP_TOKEN_ID_VAL: {
+        const fa2_token_metadata_t *token;
+        uint8_t                     chunk;
+        uint8_t                     chunk_bits;
+
+        tz_must(tz_parser_read(state, &b));
+
+        /* Micheline INT uses signed Zarith; token_id must be non-negative. */
+        if (op->frame->step_read_fa2.token_id_shift == 0) {
+            FA2_REQUIRE(state, (b & 0x40u) == 0);
+            chunk      = b & 0x3Fu;
+            chunk_bits = 6;
+        } else {
+            chunk      = b & 0x7Fu;
+            chunk_bits = 7;
+        }
+
+        FA2_REQUIRE(
+            state,
+            op->frame->step_read_fa2.token_id_shift < 64
+                && chunk <= (UINT64_MAX
+                             >> op->frame->step_read_fa2.token_id_shift));
+
+        op->frame->step_read_fa2.token_id_val
+            |= ((uint64_t)chunk << op->frame->step_read_fa2.token_id_shift);
+
+        if (b & 0x80u) {
+            op->frame->step_read_fa2.token_id_shift += chunk_bits;
+            FA2_REQUIRE(state, op->frame->step_read_fa2.token_id_shift < 64);
+            tz_continue;
+        }
+
+        token = fa2_find_token(op->destination,
+                               op->frame->step_read_fa2.token_id_val);
+
+        if (token != NULL) {
+            op->frame->step_read_fa2.token_idx = fa2_token_index(token);
+        } else {
+            /* Unregistered token: decimals/symbol are unknown. Rather than
+               falling back to raw Micheline, display the decoded fields with
+               the raw (integer) amount. token_idx == -1 selects that path in
+               the emit steps. */
+            op->frame->step_read_fa2.token_idx = -1;
+        }
+
+        op->frame->step_read_fa2.sub_step = FA2_STEP_AMOUNT_TAG;
+        tz_continue;
+    }
+
+    /* ---- amount ---- */
+    case FA2_STEP_AMOUNT_TAG:
+        tz_must(tz_parser_read(state, &b));
+        FA2_REQUIRE(state, b == 0x00);
+        /* Initialize num parser for amount */
+        tz_parse_num_state_init(&state->buffers.num,
+                                &op->frame->step_read_fa2.num_state);
+        op->frame->step_read_fa2.sub_step = FA2_STEP_AMOUNT_VAL;
+        tz_continue;
+
+    case FA2_STEP_AMOUNT_VAL: {
+        tz_must(tz_parser_read(state, &b));
+        /* Micheline int uses signed Zarith; natural=1 would double positive
+         * values. */
+        tz_must(tz_parse_int_step(&state->buffers.num,
+                                  &op->frame->step_read_fa2.num_state, b));
+        if (!op->frame->step_read_fa2.num_state.stop) {
+            tz_continue;
+        }
+        op->frame->step_read_fa2.sub_step = FA2_STEP_VERIFY_END;
+        tz_continue;
+    }
+
+    case FA2_STEP_VERIFY_END:
+        /* Verify we are at the end of the parameter (no extra items) */
+        FA2_REQUIRE(state, state->ofs == op->frame->stop);
+
+        op->frame->step_read_fa2.sub_step = FA2_STEP_EMIT_TO_ADDR;
+        tz_continue;
+
+    case FA2_STEP_EMIT_TO_ADDR:
+        /* Emit receiver address before token amount */
+        if (regs->oofs > 0) {
+            tz_stop(IM_FULL);
+        }
+        STRLCPY(state->field_info.field_name, "Transfer tokens to");
+        state->field_info.is_field_complex = false;
+        state->field_info.field_index++;
+        /* For an unregistered token, show the raw token id before the raw
+           amount so the user can tell which token is being moved. */
+        op->frame->step_read_fa2.sub_step
+            = (op->frame->step_read_fa2.token_idx < 0)
+                  ? FA2_STEP_EMIT_TOKEN_ID
+                  : FA2_STEP_EMIT_AMOUNT;
+        tz_must(push_frame(state, TZ_OPERATION_STEP_PRINT));
+        op->frame->step_print.str = (char *)(CAPTURE + FA2_TO_ADDR_OFS);
+        tz_continue;
+
+    case FA2_STEP_EMIT_TOKEN_ID:
+        /* Emit "Token ID" for unregistered tokens. The sender address slot
+           (FROM_ADDR half of CAPTURE) is no longer needed and is reused as
+           scratch for the formatted id. */
+        if (regs->oofs > 0) {
+            tz_stop(IM_FULL);
+        }
+        if (!tz_u64_to_string((char *)(CAPTURE + FA2_FROM_ADDR_OFS),
+                              FA2_ADDR_MAX_LEN,
+                              op->frame->step_read_fa2.token_id_val)) {
+            tz_raise(INVALID_STATE);
+        }
+        STRLCPY(state->field_info.field_name, "Token ID");
+        state->field_info.is_field_complex = false;
+        state->field_info.field_index++;
+        op->frame->step_read_fa2.sub_step = FA2_STEP_EMIT_AMOUNT;
+        tz_must(push_frame(state, TZ_OPERATION_STEP_PRINT));
+        op->frame->step_print.str = (char *)(CAPTURE + FA2_FROM_ADDR_OFS);
+        tz_continue;
+
+    case FA2_STEP_EMIT_AMOUNT:
+        /* Emit the amount: "Token Amount" (with symbol) for a registered
+           token, or "Amount (raw)" (the on-chain integer, decimals unknown)
+           for an unregistered one. */
+        if (regs->oofs > 0) {
+            tz_stop(IM_FULL);
+        }
+        {
+            const fa2_token_metadata_t *token
+                = fa2_token_by_index(op->frame->step_read_fa2.token_idx);
+            if (token != NULL) {
+                tz_format_token_amount((char *)state->buffers.num.decimal,
+                                       sizeof(state->buffers.num.decimal),
+                                       token->decimals, token->symbol);
+                STRLCPY(state->field_info.field_name, "Token Amount");
+            } else {
+                STRLCPY(state->field_info.field_name, "Amount (raw)");
+            }
+        }
+        state->field_info.is_field_complex = false;
+        state->field_info.field_index++;
+        /* Pop the FA2 frame first, then push PRINT so PRINT pops to parent */
+        tz_must(pop_frame(state));
+        tz_must(push_frame(state, TZ_OPERATION_STEP_PRINT));
+        op->frame->step_print.str = (char *)state->buffers.num.decimal;
+        tz_continue;
+
+    default:
+        tz_raise(INVALID_STATE);
+    }
+    tz_continue;
+}
+
+static tz_parser_result
+sdp_fail_to_micheline(tz_parser_state *state)
+{
+    tz_operation_state *op   = &state->operation;
+    tz_parser_regs     *regs = &state->regs;
+    size_t consumed          = (size_t)(state->ofs - op->sdp_payload_start);
+
+    /* If SDP parsing spanned an APDU refill boundary, `consumed` (a global
+       byte count) can exceed the current window offset; rewinding would
+       underflow regs->iofs to ~2^64 and let the Micheline parser read
+       arbitrary memory. Reject instead. */
+    if (consumed > regs->iofs) {
+        tz_raise(UNSUPPORTED);
+    }
+    regs->ilen += consumed;
+    regs->iofs -= consumed;
+    state->ofs                            = op->sdp_payload_start;
+    state->field_info.is_field_complex    = true;
+    op->frame->step                       = TZ_OPERATION_STEP_READ_MICHELINE;
+    op->frame->step_read_micheline.inited = 0;
+    op->frame->step_read_micheline.skip   = op->sdp_expr_skip;
+    op->frame->step_read_micheline.name   = op->sdp_reparse_field_name;
+    tz_micheline_parser_init(state);
+    tz_continue;
+}
+
+#define SDP_STEP_SAVE_START     0
+#define SDP_STEP_OUTER_PAIR_TAG 1
+#define SDP_STEP_OUTER_PAIR_OP  2
+#define SDP_STEP_FIRST_INT_TAG  3
+#define SDP_STEP_FIRST_INT_READ 4
+#define SDP_STEP_INNER_PAIR_TAG 5
+#define SDP_STEP_INNER_PAIR_OP  6
+#define SDP_STEP_EDGE_INT_TAG   7
+#define SDP_STEP_EDGE_INT_READ  8
+#define SDP_STEP_UNIT_PRIM0     9
+#define SDP_STEP_UNIT_OP        10
+#define SDP_STEP_EMIT_LIMIT     11
+#define SDP_STEP_EMIT_EDGE      12
+#define SDP_STEP_DONE           13
+
+/**
+ * @brief Read set_delegate_parameters Micheline (Pair int (Pair int Unit))
+ */
+static tz_parser_result
+tz_step_read_set_delegate_params(tz_parser_state *state)
+{
+    ASSERT_STEP(state, READ_SET_DELEGATE_PARAMS);
+    tz_operation_state *op = &state->operation;
+    uint8_t             b;
+
+    switch (op->frame->step_read_sdp.sub_step) {
+    case SDP_STEP_SAVE_START:
+        op->sdp_payload_start             = state->ofs;
+        op->frame->step_read_sdp.sub_step = SDP_STEP_OUTER_PAIR_TAG;
+        tz_continue;
+    case SDP_STEP_OUTER_PAIR_TAG:
+        tz_must(tz_parser_read(state, &b));
+        if (b != (uint8_t)TZ_MICHELINE_TAG_PRIM_2_NOANNOTS) {
+            tz_must(sdp_fail_to_micheline(state));
+            tz_continue;
+        }
+        op->frame->step_read_sdp.sub_step = SDP_STEP_OUTER_PAIR_OP;
+        tz_continue;
+    case SDP_STEP_OUTER_PAIR_OP:
+        tz_must(tz_parser_read(state, &b));
+        if (b != (uint8_t)TZ_MICHELSON_OP_Pair) {
+            tz_must(sdp_fail_to_micheline(state));
+            tz_continue;
+        }
+        op->frame->step_read_sdp.sub_step = SDP_STEP_FIRST_INT_TAG;
+        tz_continue;
+    case SDP_STEP_FIRST_INT_TAG:
+        tz_must(tz_parser_read(state, &b));
+        if (b != (uint8_t)TZ_MICHELINE_TAG_INT) {
+            tz_must(sdp_fail_to_micheline(state));
+            tz_continue;
+        }
+        tz_parse_num_state_init(&state->buffers.num,
+                                &op->frame->step_read_sdp.int_regs);
+        op->frame->step_read_sdp.int_regs.stop = 0;
+        op->frame->step_read_sdp.sub_step      = SDP_STEP_FIRST_INT_READ;
+        tz_continue;
+    case SDP_STEP_FIRST_INT_READ:
+        tz_must(tz_parser_read(state, &b));
+        tz_must(tz_parse_int_step(&state->buffers.num,
+                                  &op->frame->step_read_sdp.int_regs, b));
+        if (!op->frame->step_read_sdp.int_regs.stop) {
+            tz_continue;
+        }
+        strlcpy(op->sdp_limit_decimal, state->buffers.num.decimal,
+                sizeof(op->sdp_limit_decimal));
+        op->frame->step_read_sdp.sub_step = SDP_STEP_INNER_PAIR_TAG;
+        tz_continue;
+    case SDP_STEP_INNER_PAIR_TAG:
+        tz_must(tz_parser_read(state, &b));
+        if (b != (uint8_t)TZ_MICHELINE_TAG_PRIM_2_NOANNOTS) {
+            tz_must(sdp_fail_to_micheline(state));
+            tz_continue;
+        }
+        op->frame->step_read_sdp.sub_step = SDP_STEP_INNER_PAIR_OP;
+        tz_continue;
+    case SDP_STEP_INNER_PAIR_OP:
+        tz_must(tz_parser_read(state, &b));
+        if (b != (uint8_t)TZ_MICHELSON_OP_Pair) {
+            tz_must(sdp_fail_to_micheline(state));
+            tz_continue;
+        }
+        op->frame->step_read_sdp.sub_step = SDP_STEP_EDGE_INT_TAG;
+        tz_continue;
+    case SDP_STEP_EDGE_INT_TAG:
+        tz_must(tz_parser_read(state, &b));
+        if (b != (uint8_t)TZ_MICHELINE_TAG_INT) {
+            tz_must(sdp_fail_to_micheline(state));
+            tz_continue;
+        }
+        tz_parse_num_state_init(&state->buffers.num,
+                                &op->frame->step_read_sdp.int_regs);
+        op->frame->step_read_sdp.int_regs.stop = 0;
+        op->frame->step_read_sdp.sub_step      = SDP_STEP_EDGE_INT_READ;
+        tz_continue;
+    case SDP_STEP_EDGE_INT_READ:
+        tz_must(tz_parser_read(state, &b));
+        tz_must(tz_parse_int_step(&state->buffers.num,
+                                  &op->frame->step_read_sdp.int_regs, b));
+        if (!op->frame->step_read_sdp.int_regs.stop) {
+            tz_continue;
+        }
+        strlcpy(op->sdp_edge_decimal, state->buffers.num.decimal,
+                sizeof(op->sdp_edge_decimal));
+        op->frame->step_read_sdp.sub_step = SDP_STEP_UNIT_PRIM0;
+        tz_continue;
+    case SDP_STEP_UNIT_PRIM0:
+        tz_must(tz_parser_read(state, &b));
+        if (b != (uint8_t)TZ_MICHELINE_TAG_PRIM_0_NOANNOTS) {
+            tz_must(sdp_fail_to_micheline(state));
+            tz_continue;
+        }
+        op->frame->step_read_sdp.sub_step = SDP_STEP_UNIT_OP;
+        tz_continue;
+    case SDP_STEP_UNIT_OP:
+        tz_must(tz_parser_read(state, &b));
+        if (b != (uint8_t)TZ_MICHELSON_OP_Unit) {
+            tz_must(sdp_fail_to_micheline(state));
+            tz_continue;
+        }
+        if (state->ofs != op->frame->stop) {
+            tz_must(sdp_fail_to_micheline(state));
+            tz_continue;
+        }
+        op->frame->step_read_sdp.sub_step = SDP_STEP_EMIT_LIMIT;
+        tz_continue;
+    case SDP_STEP_EMIT_LIMIT:
+        STRLCPY(state->field_info.field_name, "Limit (stake/bake)");
+        state->field_info.is_field_complex = false;
+        strlcpy((char *)CAPTURE, op->sdp_limit_decimal, sizeof(CAPTURE));
+        op->frame->step_read_sdp.sub_step = SDP_STEP_EMIT_EDGE;
+        tz_must(push_frame(state, TZ_OPERATION_STEP_PRINT));
+        op->frame->step_print.str = (char *)CAPTURE;
+        tz_continue;
+    case SDP_STEP_EMIT_EDGE:
+        STRLCPY(state->field_info.field_name, "Edge (bake/stake)");
+        state->field_info.is_field_complex = false;
+        strlcpy((char *)CAPTURE, op->sdp_edge_decimal, sizeof(CAPTURE));
+        op->frame->step_read_sdp.sub_step = SDP_STEP_DONE;
+        tz_must(push_frame(state, TZ_OPERATION_STEP_PRINT));
+        op->frame->step_print.str = (char *)CAPTURE;
+        tz_continue;
+    case SDP_STEP_DONE:
+        tz_must(pop_frame(state));
+        if (state->regs.oofs > 0) {
+            tz_stop(IM_FULL);
+        }
+        tz_continue;
+    default:
+        tz_raise(INVALID_STATE);
+    }
+}
+
 /**
  * @brief Read a micheline expression
  *
@@ -580,6 +1394,16 @@ tz_step_read_micheline(tz_parser_state *state)
     ASSERT_STEP(state, READ_MICHELINE);
     tz_operation_state *op   = &state->operation;
     tz_parser_regs     *regs = &state->regs;
+    if (op->emit_finalize_note) {
+        op->emit_finalize_note             = 0;
+        state->field_info.is_field_complex = false;
+        STRLCPY(state->field_info.field_name, "Note");
+        strlcpy((char *)CAPTURE, "Fee payer is Source; staker is Destination",
+                sizeof(CAPTURE));
+        tz_must(push_frame(state, TZ_OPERATION_STEP_PRINT));
+        op->frame->step_print.str = (char *)CAPTURE;
+        tz_continue;
+    }
     if (!op->frame->step_read_micheline.inited) {
         op->frame->step_read_micheline.inited = 1;
         STRLCPY(state->field_info.field_name,
@@ -607,14 +1431,24 @@ tz_step_read_micheline(tz_parser_state *state)
 /**
  * @brief Format a string as an amount
  *
- * @param str: string to format
+ * @param str: string to format (in place)
+ * @param size: capacity of the str buffer
+ * @return bool: true on success, false if the result would not fit
  */
-static void
-tz_format_amount(char *str)
+static bool
+tz_format_amount(char *str, size_t size)
 {
     int len = 0;
     while (str[len]) {
         len++;
+    }
+    /* Sub-1-XTZ values are left-padded up to 7 digits ("0.xxxxxx"), so the
+       effective length is at least 7. On top of that the output adds a '.'
+       (1 byte), the " XTZ" suffix (4 bytes) and a NUL terminator. Reject
+       rather than writing past the buffer (F-08). */
+    size_t out_len = ((len < 7) ? 7U : (size_t)len) + 6U;
+    if (out_len > size) {
+        return false;
     }
     if ((len == 1) && (str[0] == 0)) {
         // just 0
@@ -661,6 +1495,7 @@ add_currency:
     str[len + 3] = 'Z';
     len += 4;
     str[len] = 0;
+    return true;
 }
 
 /**
@@ -706,7 +1541,9 @@ tz_step_read_num(tz_parser_state *state)
             break;
         case TZ_OPERATION_FIELD_FEE:
         case TZ_OPERATION_FIELD_AMOUNT: {
-            tz_format_amount(str);
+            if (!tz_format_amount(str, sizeof(state->buffers.num.decimal))) {
+                tz_raise(INVALID_DATA);
+            }
             break;
         }
         default:
@@ -759,7 +1596,7 @@ tz_step_read_bytes(tz_parser_state *state)
         tz_must(tz_parser_read(state, c));
         op->frame->step_read_bytes.ofs++;
     } else {
-        if (op->frame->step_read_num.skip) {
+        if (op->frame->step_read_bytes.skip) {
             tz_must(pop_frame(state));
             tz_continue;
         }
@@ -803,13 +1640,26 @@ tz_step_read_bytes(tz_parser_state *state)
                 tz_raise(INVALID_TAG);
             }
             break;
-        case TZ_OPERATION_FIELD_DESTINATION:
+        case TZ_OPERATION_FIELD_DESTINATION: {
+            const fa2_token_metadata_t *token;
             memcpy(op->destination, CAPTURE, 22);
+            /* Always display the destination so the user can verify which
+               contract they interact with, even for registered tokens and
+               non-"transfer" entrypoints (e.g. approve, update_operators). */
+            token = fa2_find_token(op->destination, 0);
             if (tz_format_address(CAPTURE, 22, (char *)CAPTURE,
                                   sizeof(CAPTURE))) {
                 tz_raise(INVALID_TAG);
             }
+            if ((token != NULL) && token->name[0]) {
+                /* Show the token name alongside the contract address for
+                   recognized tokens. */
+                strlcat((char *)CAPTURE, " (", sizeof(CAPTURE));
+                strlcat((char *)CAPTURE, token->name, sizeof(CAPTURE));
+                strlcat((char *)CAPTURE, ")", sizeof(CAPTURE));
+            }
             break;
+        }
         case TZ_OPERATION_FIELD_OPH:
             if (tz_format_oph(CAPTURE, 32, (char *)CAPTURE,
                               sizeof(CAPTURE))) {
@@ -881,9 +1731,17 @@ tz_step_read_string(tz_parser_state *state)
     tz_operation_state *op = &state->operation;
     if (state->ofs == op->frame->stop) {
         CAPTURE[op->frame->step_read_string.ofs] = 0;
+        if (op->frame->step_read_string.check_fa2) {
+            if (strcmp((char *)CAPTURE, "transfer") == 0) {
+                op->is_fa2_candidate = 1;
+            }
+        }
         tz_must(tz_print_string(state));
     } else {
         uint8_t b;
+        if (op->frame->step_read_string.ofs >= TZ_CAPTURE_BUFFER_SIZE - 1) {
+            tz_raise(TOO_LARGE);
+        }
         tz_must(tz_parser_read(state, &b));
         CAPTURE[op->frame->step_read_string.ofs] = b;
         op->frame->step_read_string.ofs++;
@@ -924,6 +1782,57 @@ tz_step_read_binary(tz_parser_state *state)
 }
 
 /**
+ * @brief Emit the ASCII entrypoint name after reading a builtin index byte
+ */
+static tz_parser_result
+emit_builtin_entrypoint_name(tz_parser_state *state, uint8_t b)
+{
+    const char *ep = NULL;
+
+    switch (b) {
+    case 0:
+        ep = "default";
+        break;
+    case 1:
+        ep = "root";
+        break;
+    case 2:
+        ep = "do";
+        break;
+    case 3:
+        ep = "set_delegate";
+        break;
+    case 4:
+        ep = "remove_delegate";
+        break;
+    case 5:
+        ep = "deposit";
+        break;
+    case 6:
+        ep = "stake";
+        break;
+    case 7:
+        ep = "unstake";
+        break;
+    case 8:
+        ep = "finalize_unstake";
+        if (tz_implicit_fee_payer_differs_from_dest(&state->operation)) {
+            state->operation.emit_finalize_note = 1;
+        }
+        break;
+    case 9:
+        ep = "set_delegate_parameters";
+        break;
+    default:
+        tz_raise(INVALID_TAG);
+    }
+    strlcpy((char *)CAPTURE, ep, sizeof(CAPTURE));
+    tz_manager_entrypoint_set(&state->operation, ep);
+    tz_must(tz_print_string(state));
+    tz_continue;
+}
+
+/**
  * @brief Read a smart entrypoint
  *
  * @param state: parser state
@@ -935,58 +1844,21 @@ tz_step_read_smart_entrypoint(tz_parser_state *state)
     ASSERT_STEP(state, READ_SMART_ENTRYPOINT);
     tz_operation_state *op = &state->operation;
     uint8_t             b;
+
     tz_must(tz_parser_read(state, &b));
-    switch (b) {
-    case 0:
-        strlcpy((char *)CAPTURE, "default", sizeof(CAPTURE));
-        tz_must(tz_print_string(state));
-        break;
-    case 1:
-        strlcpy((char *)CAPTURE, "root", sizeof(CAPTURE));
-        tz_must(tz_print_string(state));
-        break;
-    case 2:
-        strlcpy((char *)CAPTURE, "do", sizeof(CAPTURE));
-        tz_must(tz_print_string(state));
-        break;
-    case 3:
-        strlcpy((char *)CAPTURE, "set_delegate", sizeof(CAPTURE));
-        tz_must(tz_print_string(state));
-        break;
-    case 4:
-        strlcpy((char *)CAPTURE, "remove_delegate", sizeof(CAPTURE));
-        tz_must(tz_print_string(state));
-        break;
-    case 5:
-        strlcpy((char *)CAPTURE, "deposit", sizeof(CAPTURE));
-        tz_must(tz_print_string(state));
-        break;
-    case 6:
-        strlcpy((char *)CAPTURE, "stake", sizeof(CAPTURE));
-        tz_must(tz_print_string(state));
-        break;
-    case 7:
-        strlcpy((char *)CAPTURE, "unstake", sizeof(CAPTURE));
-        tz_must(tz_print_string(state));
-        break;
-    case 8:
-        strlcpy((char *)CAPTURE, "finalize_unstake", sizeof(CAPTURE));
-        tz_must(tz_print_string(state));
-        break;
-    case 9:
-        strlcpy((char *)CAPTURE, "set_delegate_parameters", sizeof(CAPTURE));
-        tz_must(tz_print_string(state));
-        break;
-    case 0xFF:
+
+    if (b == 0xFF) {
         op->frame->step                 = TZ_OPERATION_STEP_READ_STRING;
         op->frame->step_read_string.ofs = 0;
+        op->frame->step_read_string.check_fa2
+            = (op->destination[0] == 1) ? 1 : 0;
         tz_must(push_frame(state, TZ_OPERATION_STEP_SIZE));
         op->frame->step_size.size     = 0;
         op->frame->step_size.size_len = 1;
-        break;
-    default:
-        tz_raise(INVALID_TAG);
+        tz_continue;
     }
+
+    tz_must(emit_builtin_entrypoint_name(state, b));
     tz_continue;
 }
 
@@ -1029,9 +1901,10 @@ tz_step_field(tz_parser_state *state)
         break;
     }
     case TZ_OPERATION_FIELD_BINARY: {
-        op->frame->step                  = TZ_OPERATION_STEP_READ_BINARY;
-        op->frame->step_read_string.ofs  = 0;
-        op->frame->step_read_string.skip = field->skip;
+        op->frame->step                       = TZ_OPERATION_STEP_READ_BINARY;
+        op->frame->step_read_string.ofs       = 0;
+        op->frame->step_read_string.skip      = field->skip;
+        op->frame->step_read_string.check_fa2 = 0;
         tz_must(push_frame(state, TZ_OPERATION_STEP_SIZE));
         op->frame->step_size.size     = 0;
         op->frame->step_size.size_len = 4;
@@ -1130,24 +2003,54 @@ tz_step_field(tz_parser_state *state)
     }
     case TZ_OPERATION_FIELD_SMART_ENTRYPOINT: {
         op->frame->step = TZ_OPERATION_STEP_READ_SMART_ENTRYPOINT;
-        op->frame->step_read_string.ofs  = 0;
-        op->frame->step_read_string.skip = field->skip;
+        op->frame->step_read_string.ofs       = 0;
+        op->frame->step_read_string.skip      = field->skip;
+        op->frame->step_read_string.check_fa2 = 0;
         break;
     }
     case TZ_OPERATION_FIELD_EXPR: {
-        op->frame->step = TZ_OPERATION_STEP_READ_MICHELINE;
-        op->frame->step_read_micheline.inited = 0;
-        op->frame->step_read_micheline.skip   = field->skip;
-        op->frame->step_read_micheline.name   = name;
+        if (op->is_fa2_candidate && !field->skip) {
+            const fa2_token_metadata_t *token;
+            state->field_info.is_field_complex = false;
+            op->frame->step = TZ_OPERATION_STEP_READ_FA2_TRANSFER;
+            op->frame->step_read_fa2.sub_step       = FA2_STEP_OUTER_SEQ_TAG;
+            op->frame->step_read_fa2.addr_ofs       = 0;
+            op->frame->step_read_fa2.size_ofs       = 0;
+            op->frame->step_read_fa2.size_val       = 0;
+            op->frame->step_read_fa2.addr_len       = 0;
+            op->frame->step_read_fa2.token_id_shift = 0;
+            op->frame->step_read_fa2.token_id_val   = 0;
+            op->frame->step_read_fa2.token_idx      = -1;
+
+            token = fa2_find_token(op->destination,
+                                   op->frame->step_read_fa2.token_id_val);
+            if (token != NULL) {
+                op->frame->step_read_fa2.token_idx = fa2_token_index(token);
+            }
+        } else if ((strcmp(op->manager_entrypoint, "set_delegate_parameters")
+                    == 0)
+                   && !field->skip) {
+            op->frame->step = TZ_OPERATION_STEP_READ_SET_DELEGATE_PARAMS;
+            op->frame->step_read_sdp.sub_step = SDP_STEP_SAVE_START;
+            op->sdp_expr_skip                 = field->skip;
+            STRLCPY(op->sdp_reparse_field_name, name);
+            state->field_info.is_field_complex = false;
+        } else {
+            op->frame->step = TZ_OPERATION_STEP_READ_MICHELINE;
+            op->frame->step_read_micheline.inited = 0;
+            op->frame->step_read_micheline.skip   = field->skip;
+            op->frame->step_read_micheline.name   = name;
+        }
         tz_must(push_frame(state, TZ_OPERATION_STEP_SIZE));
         op->frame->step_size.size     = 0;
         op->frame->step_size.size_len = 4;
         break;
     }
     case TZ_OPERATION_FIELD_STRING: {
-        op->frame->step                  = TZ_OPERATION_STEP_READ_STRING;
-        op->frame->step_read_string.ofs  = 0;
-        op->frame->step_read_string.skip = field->skip;
+        op->frame->step                       = TZ_OPERATION_STEP_READ_STRING;
+        op->frame->step_read_string.ofs       = 0;
+        op->frame->step_read_string.skip      = field->skip;
+        op->frame->step_read_string.check_fa2 = 0;
         tz_must(push_frame(state, TZ_OPERATION_STEP_SIZE));
         op->frame->step_size.size     = 0;
         op->frame->step_size.size_len = 4;
@@ -1534,6 +2437,12 @@ tz_operation_parser_step(tz_parser_state *state)
         break;
     case TZ_OPERATION_STEP_READ_PKH_LIST:
         tz_must(tz_step_read_pkh_list(state));
+        break;
+    case TZ_OPERATION_STEP_READ_FA2_TRANSFER:
+        tz_must(tz_step_read_fa2_transfer(state));
+        break;
+    case TZ_OPERATION_STEP_READ_SET_DELEGATE_PARAMS:
+        tz_must(tz_step_read_set_delegate_params(state));
         break;
     case TZ_OPERATION_STEP_PRINT:
     case TZ_OPERATION_STEP_PARTIAL_PRINT:
